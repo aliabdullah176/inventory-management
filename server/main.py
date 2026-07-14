@@ -2,9 +2,19 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import datetime, timedelta
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
+
+# Fixed delivery lead time (days) applied to submitted restocking orders
+LEAD_TIME_DAYS = 14
+
+# In-memory task store. The frontend also merges its own mock user tasks
+# (numeric ids) client-side, so API tasks use string ids ("task-N") to avoid
+# id collisions. In-memory only, so tasks reset on server restart.
+tasks: list = []
+_next_task_num = 1
 
 # Quarter mapping for date filtering
 QUARTER_MAP = {
@@ -120,6 +130,29 @@ class CreatePurchaseOrderRequest(BaseModel):
     expected_delivery_date: str
     notes: Optional[str] = None
 
+class RestockItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_price: float
+
+class CreateOrderRequest(BaseModel):
+    items: List[RestockItem]
+    customer: Optional[str] = "Internal Restock"
+    warehouse: Optional[str] = None
+
+class Task(BaseModel):
+    id: str
+    title: str
+    priority: str
+    dueDate: str
+    status: str
+
+class CreateTaskRequest(BaseModel):
+    title: str
+    priority: Optional[str] = "medium"
+    dueDate: str
+
 # API endpoints
 @app.get("/")
 def root():
@@ -160,6 +193,47 @@ def get_order(order_id: str):
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     return order
+
+@app.post("/api/orders", response_model=Order)
+def create_order(payload: CreateOrderRequest):
+    """Create a restocking order.
+
+    Appends to the in-memory orders list with status 'Submitted' so it surfaces
+    in the Orders view. Delivery is scheduled a fixed LEAD_TIME_DAYS out.
+    Data is in-memory only, so submitted orders reset on server restart.
+    """
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="Order must contain at least one item")
+
+    # Sequential numeric id/order_number based on existing orders
+    next_id = max((int(o["id"]) for o in orders), default=0) + 1
+    now = datetime.now()
+
+    items = [item.model_dump() for item in payload.items]
+    total_value = round(sum(item["quantity"] * item["unit_price"] for item in items), 2)
+
+    # Derive category from the first item's matching inventory record, if any
+    first_sku = items[0]["sku"]
+    inventory_match = next((inv for inv in inventory_items if inv["sku"] == first_sku), None)
+    category = inventory_match["category"] if inventory_match else None
+    warehouse = payload.warehouse or (inventory_match["warehouse"] if inventory_match else None)
+
+    new_order = {
+        "id": str(next_id),
+        "order_number": f"ORD-2025-{next_id:04d}",
+        "customer": payload.customer or "Internal Restock",
+        "items": items,
+        "status": "Submitted",
+        "order_date": now.isoformat(timespec="seconds"),
+        "expected_delivery": (now + timedelta(days=LEAD_TIME_DAYS)).isoformat(timespec="seconds"),
+        "total_value": total_value,
+        "actual_delivery": None,
+        "warehouse": warehouse,
+        "category": category,
+    }
+
+    orders.append(new_order)
+    return new_order
 
 @app.get("/api/demand", response_model=List[DemandForecast])
 def get_demand_forecasts():
@@ -226,6 +300,45 @@ def get_category_spending():
 def get_recent_transactions():
     """Get recent transactions"""
     return recent_transactions
+
+@app.get("/api/tasks", response_model=List[Task])
+def get_tasks():
+    """Get all user-created tasks (in-memory)."""
+    return tasks
+
+@app.post("/api/tasks", response_model=Task)
+def create_task(payload: CreateTaskRequest):
+    """Create a task. New tasks default to 'pending' status."""
+    global _next_task_num
+    new_task = {
+        "id": f"task-{_next_task_num}",
+        "title": payload.title,
+        "priority": payload.priority or "medium",
+        "dueDate": payload.dueDate,
+        "status": "pending",
+    }
+    _next_task_num += 1
+    # Prepend so newest tasks surface first, matching the frontend's ordering
+    tasks.insert(0, new_task)
+    return new_task
+
+@app.patch("/api/tasks/{task_id}", response_model=Task)
+def toggle_task(task_id: str):
+    """Toggle a task between 'pending' and 'completed'."""
+    task = next((t for t in tasks if t["id"] == task_id), None)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task["status"] = "completed" if task["status"] == "pending" else "pending"
+    return task
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: str):
+    """Delete a task."""
+    task = next((t for t in tasks if t["id"] == task_id), None)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    tasks.remove(task)
+    return {"success": True, "id": task_id}
 
 @app.get("/api/reports/quarterly")
 def get_quarterly_reports():
